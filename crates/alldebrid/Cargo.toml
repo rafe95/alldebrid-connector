@@ -1,0 +1,28 @@
+[package]
+name = "alldebrid"
+version = "0.1.0"
+description = "Async client for the AllDebrid API (magnets, links, live status)"
+keywords = ["alldebrid", "debrid", "magnet", "torrent", "api"]
+categories = ["api-bindings", "asynchronous"]
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream = "0.3"
+fastrand = "2"
+futures-core = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time", "sync"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+wiremock = "0.6"
