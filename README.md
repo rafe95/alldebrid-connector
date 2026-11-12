@@ -20,7 +20,7 @@ There is **no authentication**. Keep ports 8080 and 8081 on your LAN.
 ## Web UI
 
 `compose.yaml` also starts an optional `web` service: plain HTML, CSS and JavaScript from
-`web/`, served by nginx on <http://localhost:8081>, which forwards `/api/` to the
+`web/`, served by nginx on <http://localhost:8081> (change the port with `WEB_PORT`), which forwards `/api/` to the
 connector. Use it to paste a magnet or drop a `.torrent`, pick a category, and follow or
 remove downloads. The connector works without it; delete the service if you don't need it.
 
@@ -74,12 +74,37 @@ containers), or configure a remote path mapping.
 | `AD_POLL_SECONDS` | `5` | How often AllDebrid is polled |
 | `RUST_LOG` | `info` | Log level |
 
+Two more variables are read by `compose.yaml` itself (from `.env` or the shell) and set
+the ports published on the host:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `API_PORT` | `8080` | Host port of the connector API (what Radarr connects to) |
+| `WEB_PORT` | `8081` | Host port of the web UI |
+
 ## How it behaves
 
 - Items are queued and sent to AllDebrid as its limit of 30 active magnets allows.
 - The queue is saved in `/data/state.json`; after a restart, downloads resume.
 - Files are written as `<name>.part`, resumed with HTTP `Range`, size-checked, then renamed.
 - Re-adding an item that failed retries it; re-adding anything else is a no-op.
+
+## Releasing
+
+Releases are cut by GitHub Actions when a version tag is pushed:
+
+1. Set the new version in `crates/alldebrid-connector/Cargo.toml` and commit it to `main`.
+2. Tag that commit and push the tag:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+The `Release` workflow runs the tests, builds the image for `linux/amd64` and `linux/arm64`,
+pushes it to `ghcr.io/rafe95/alldebrid-connector` as `0.2.0`, `0.2` and `latest`, and creates
+a GitHub release with generated notes. It fails early if the tag and the crate version differ.
+Every push to `main` and every pull request runs the `CI` workflow (format, clippy, tests).
 
 ## Layout
 
