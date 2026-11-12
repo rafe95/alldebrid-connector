@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AllDebrid connector</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>AllDebrid connector</h1>
+
+    <form id="add">
+      <label for="link">Magnet, info-hash or link to a .torrent</label>
+      <input id="link" type="text" placeholder="magnet:?xt=urn:btih:…" autocomplete="off">
+      <div class="row">
+        <label class="file">
+          <span>or a .torrent file</span>
+          <input id="file" type="file" accept=".torrent,application/x-bittorrent" multiple>
+        </label>
+        <label>
+          <span>Category</span>
+          <select id="category"></select>
+        </label>
+        <button type="submit">Add</button>
+      </div>
+      <p id="message" role="status"></p>
+    </form>
+
+    <h2>Downloads</h2>
+    <p id="empty">Nothing here yet.</p>
+    <div class="scroll"><table id="list" hidden>
+      <thead>
+        <tr><th>Name</th><th>Category</th><th>State</th><th>Progress</th><th>Size</th><th></th></tr>
+      </thead>
+      <tbody></tbody>
+    </table></div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

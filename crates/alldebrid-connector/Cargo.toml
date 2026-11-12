@@ -1,0 +1,26 @@
+[package]
+name = "alldebrid-connector"
+version = "0.1.0"
+description = "Backend that sends torrents to AllDebrid and downloads the results into category folders"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alldebrid = { path = "../alldebrid" }
+anyhow = "1"
+axum = { version = "0.8", features = ["multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "fs", "io-util", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
+tempfile = "3"
+wiremock = "0.6"

@@ -1,0 +1,33 @@
+services:
+  alldebrid-connector:
+    build: .
+    container_name: alldebrid-connector
+    restart: unless-stopped
+    ports:
+      # LAN only: there is no authentication. Do not expose this port to the internet.
+      - "8080:8080"
+    environment:
+      ALLDEBRID_API_KEY: ${ALLDEBRID_API_KEY:?set ALLDEBRID_API_KEY in .env or your shell}
+      # Extra or overridden categories, as name=/path pairs. tv, movies, adult and
+      # other exist by default under /downloads.
+      # AD_CATEGORY_DIRS: "sonarr=/downloads/tv,radarr=/downloads/movies"
+      # AD_DELETE_AFTER_DOWNLOAD: "true"
+      # AD_MAX_DOWNLOADS: "2"
+    volumes:
+      - ./data:/data
+      # Change the left side to your media folder on the host.
+      - ./downloads:/downloads
+
+  # Optional web UI: static files served by nginx, which forwards /api/ to the connector.
+  # Remove this service if you only use the API or Radarr.
+  web:
+    image: docker.io/library/nginx:1-alpine
+    container_name: alldebrid-connector-web
+    restart: unless-stopped
+    depends_on:
+      - alldebrid-connector
+    ports:
+      - "8081:80"
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/alldebrid"]
+members = ["crates/alldebrid", "crates/alldebrid-connector"]
 
 [workspace.package]
 edition = "2021"
