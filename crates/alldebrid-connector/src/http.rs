@@ -184,17 +184,30 @@ async fn qb_categories(State(app): State<App>) -> Json<Value> {
     Json(Value::Object(out))
 }
 
-fn qb_state(i: &Item) -> &'static str {
+/// Whether a completed item's files are gone from disk (or cannot be read).
+fn files_missing(i: &Item) -> bool {
+    let exists = |p: &std::path::Path| p.try_exists().unwrap_or(false);
+    i.state == ItemState::Completed
+        && if i.files.is_empty() {
+            !exists(&i.content_path())
+        } else {
+            i.files.iter().any(|f| !exists(&i.folder().join(&f.path)))
+        }
+}
+
+fn qb_state(i: &Item, missing: bool) -> &'static str {
     match i.state {
         ItemState::Queued => "queuedDL",
         ItemState::Processing | ItemState::Downloading => "downloading",
+        // Radarr/Sonarr show a warning instead of failing the import.
+        ItemState::Completed if missing => "missingFiles",
         // Finished and not seeding: lets Sonarr/Radarr import and then remove it.
         ItemState::Completed => "pausedUP",
         ItemState::Failed => "error",
     }
 }
 
-fn qb_torrent(i: &Item) -> Value {
+fn qb_torrent(i: &Item, missing: bool) -> Value {
     let progress = i.progress();
     let done = i.state == ItemState::Completed;
     let speed = match i.state {
@@ -217,7 +230,7 @@ fn qb_torrent(i: &Item) -> Value {
         "dlspeed": speed,
         "upspeed": 0,
         "eta": eta,
-        "state": qb_state(i),
+        "state": qb_state(i, missing),
         "category": i.category,
         "tags": "",
         "save_path": i.save_path,
@@ -261,7 +274,7 @@ async fn qb_info(State(app): State<App>, Query(q): Query<HashMap<String, String>
             q.get("category")
                 .map_or(true, |c| i.category.eq_ignore_ascii_case(c))
         })
-        .map(qb_torrent)
+        .map(|i| qb_torrent(i, files_missing(i)))
         .collect();
     Json(json!(out))
 }
@@ -294,10 +307,55 @@ async fn qb_files(State(app): State<App>, Query(q): Query<HashMap<String, String
         .map(|h| h.to_ascii_lowercase())
         .unwrap_or_default();
     match app.store.get(&hash) {
-        Some(i) => Json(json!([{ "name": i.name, "size": i.size, "progress": i.progress() }]))
-            .into_response(),
+        Some(i) => Json(qb_file_list(&i)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// `torrents/files`: one entry per file, `name` relative to `save_path` with `/`
+/// separators, so `save_path/name` is where the file is (and, for a single file,
+/// equals `content_path`).
+fn qb_file_list(i: &Item) -> Value {
+    let folder = i.folder_name();
+    if i.files.is_empty() {
+        return json!([{
+            "index": 0, "name": folder, "size": i.size, "progress": i.progress(),
+            "priority": 1, "is_seed": false, "piece_range": [0, 0], "availability": 0,
+        }]);
+    }
+    let mut offset = 0u64;
+    let entries: Vec<Value> = i
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, f)| {
+            let progress = match i.state {
+                ItemState::Completed => 1.0,
+                ItemState::Downloading if f.size == 0 => 0.0,
+                ItemState::Downloading => {
+                    (i.local_downloaded.saturating_sub(offset) as f64 / f.size as f64).min(1.0)
+                }
+                _ => 0.0,
+            };
+            offset += f.size;
+            let rel: Vec<String> = f
+                .path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            json!({
+                "index": index,
+                "name": format!("{folder}/{}", rel.join("/")),
+                "size": f.size,
+                "progress": progress,
+                "priority": 1,
+                "is_seed": progress >= 1.0,
+                "piece_range": [0, 0],
+                "availability": if progress >= 1.0 { 1.0 } else { 0.0 },
+            })
+        })
+        .collect();
+    json!(entries)
 }
 
 /// Fields of a request sent either as a query string, a urlencoded form or a multipart form.
@@ -411,4 +469,228 @@ async fn qb_set_category(State(app): State<App>, req: Request) -> Response {
             .update(&item.hash, |i| i.category = category.clone());
     }
     "Ok.".into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::store::{ItemFile, Source};
+
+    const GRINCH: &str = "How.the.Grinch.Stole.Christmas.2000.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv";
+
+    /// A completed item whose files exist on disk below `save`.
+    fn on_disk(save: &Path, name: &str, files: &[(&str, &str)]) -> Item {
+        let mut i = Item::new(
+            "h".into(),
+            name.into(),
+            "movies".into(),
+            save.to_owned(),
+            Source::Magnet("m".into()),
+        );
+        for (rel, body) in files {
+            let path = i.folder().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            i.files.push(ItemFile {
+                path: rel.into(),
+                size: body.len() as u64,
+            });
+        }
+        i.size = i.files.iter().map(|f| f.size).sum();
+        i.state = ItemState::Completed;
+        i.completed_on = Some(1);
+        i
+    }
+
+    /// `torrents/info` and `torrents/files` for an item, through a JSON round trip.
+    fn api(i: &Item) -> (Value, Value) {
+        let text = |v: Value| serde_json::to_string(&v).unwrap();
+        let info = text(qb_torrent(i, files_missing(i)));
+        let files = text(qb_file_list(i));
+        (
+            serde_json::from_str(&info).unwrap(),
+            serde_json::from_str(&files).unwrap(),
+        )
+    }
+
+    fn path_of(v: &Value) -> PathBuf {
+        PathBuf::from(v.as_str().unwrap())
+    }
+
+    /// `save_path` + each `files[].name` must exist, and match `content_path` for one file.
+    fn assert_consistent(info: &Value, files: &Value) {
+        let save = path_of(&info["save_path"]);
+        let names: Vec<PathBuf> = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| save.join(f["name"].as_str().unwrap()))
+            .collect();
+        for n in &names {
+            assert!(n.is_file(), "{} is not a file", n.display());
+        }
+        let content = path_of(&info["content_path"]);
+        if names.len() == 1 {
+            assert_eq!(content, names[0]);
+        } else {
+            assert!(content.is_dir());
+            assert!(names.iter().all(|n| n.starts_with(&content)));
+        }
+    }
+
+    fn assert_completed(info: &Value, size: u64) {
+        assert_eq!(info["state"], "pausedUP");
+        assert_eq!(info["progress"], 1.0);
+        assert_eq!(info["amount_left"], 0);
+        assert_eq!(info["completed"], size);
+        assert_eq!(info["total_size"], size);
+        assert_eq!(info["category"], "movies");
+    }
+
+    #[test]
+    fn single_mkv_inside_a_folder_named_after_the_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let i = on_disk(&save, GRINCH, &[(GRINCH, "0123456789")]);
+        let (info, files) = api(&i);
+        assert_eq!(
+            path_of(&info["content_path"]),
+            save.join(GRINCH).join(GRINCH)
+        );
+        assert!(path_of(&info["content_path"]).is_file());
+        assert_eq!(path_of(&info["save_path"]), save);
+        assert_eq!(files[0]["name"], format!("{GRINCH}/{GRINCH}"));
+        assert_completed(&info, 10);
+        assert_consistent(&info, &files);
+    }
+
+    #[test]
+    fn single_mp4() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let i = on_disk(&save, "Some.Movie.2020.1080p", &[("some.movie.mp4", "abc")]);
+        let (info, files) = api(&i);
+        assert_eq!(
+            path_of(&info["content_path"]),
+            save.join("Some.Movie.2020.1080p/some.movie.mp4")
+        );
+        assert_completed(&info, 3);
+        assert_consistent(&info, &files);
+    }
+
+    #[test]
+    fn multi_file_reports_the_root_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let i = on_disk(
+            &save,
+            "Trilogy.Pack",
+            &[
+                ("Part.1.mkv", "1"),
+                ("Part.2.mkv", "22"),
+                ("Part.3.mkv", "333"),
+            ],
+        );
+        let (info, files) = api(&i);
+        assert_eq!(path_of(&info["content_path"]), save.join("Trilogy.Pack"));
+        assert_eq!(files.as_array().unwrap().len(), 3);
+        assert_eq!(files[2]["index"], 2);
+        assert_eq!(files[2]["name"], "Trilogy.Pack/Part.3.mkv");
+        assert_completed(&info, 6);
+        assert_consistent(&info, &files);
+    }
+
+    #[test]
+    fn multi_file_with_subtitles_keeps_subfolders() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let i = on_disk(
+            &save,
+            "Movie.2019",
+            &[
+                ("Movie.2019.mkv", "video"),
+                ("Subs/English.srt", "en"),
+                ("Subs/French.srt", "fr"),
+            ],
+        );
+        let (info, files) = api(&i);
+        assert_eq!(path_of(&info["content_path"]), save.join("Movie.2019"));
+        assert_eq!(files[1]["name"], "Movie.2019/Subs/English.srt");
+        assert_completed(&info, 9);
+        assert_consistent(&info, &files);
+    }
+
+    #[test]
+    fn incomplete_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let mut i = on_disk(&save, "Pack", &[("a.mkv", "aaaa"), ("b.mkv", "bbbb")]);
+        i.state = ItemState::Downloading;
+        i.completed_on = None;
+        i.local_downloaded = 6;
+        let (info, files) = api(&i);
+        assert_eq!(info["state"], "downloading");
+        assert!(info["progress"].as_f64().unwrap() < 1.0);
+        assert!(info["amount_left"].as_u64().unwrap() > 0);
+        assert_eq!(info["completion_on"], -1);
+        assert_eq!(files[0]["progress"], 1.0);
+        assert_eq!(files[1]["progress"], 0.5);
+
+        // Before AllDebrid has listed the files, the item folder is reported.
+        i.files.clear();
+        i.state = ItemState::Processing;
+        let (info, files) = api(&i);
+        assert_eq!(path_of(&info["content_path"]), save.join("Pack"));
+        assert_eq!(files[0]["name"], "Pack");
+    }
+
+    #[test]
+    fn special_characters_survive_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let name = r#"Amélie [2001] {Remux} (Director's Cut) 東京 "quoted" \ back & 100%"#;
+        let file = r#"Amélie [2001] "quoted" \ 東京 #1.mkv"#;
+        let i = on_disk(&save, name, &[(file, "x")]);
+        let raw = serde_json::to_string(&qb_torrent(&i, false)).unwrap();
+        // Every escape is a valid JSON one (never `\.`, `\[`, `\ `...).
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let next = chars.next().unwrap();
+                assert!(
+                    r#""\/bfnrtu"#.contains(next),
+                    "invalid escape \\{next} in {raw}"
+                );
+            }
+        }
+        let (info, files) = api(&i);
+        let folder = i.folder_name();
+        assert_eq!(info["name"], name);
+        assert_eq!(
+            path_of(&info["content_path"]),
+            save.join(&folder).join(file)
+        );
+        assert_consistent(&info, &files);
+    }
+
+    #[test]
+    fn missing_or_unreadable_files_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("movies");
+        let i = on_disk(&save, GRINCH, &[(GRINCH, "x")]);
+        assert_eq!(api(&i).0["state"], "pausedUP");
+        std::fs::remove_file(i.content_path()).unwrap();
+        assert_eq!(api(&i).0["state"], "missingFiles");
+
+        let i = on_disk(&save, "Pack", &[("a.mkv", "a"), ("b.srt", "b")]);
+        std::fs::remove_file(i.folder().join("b.srt")).unwrap();
+        assert_eq!(api(&i).0["state"], "missingFiles");
+
+        // Not completed: nothing is expected on disk yet.
+        let mut i = on_disk(&save, "Later", &[]);
+        i.state = ItemState::Downloading;
+        assert_eq!(api(&i).0["state"], "downloading");
+    }
 }

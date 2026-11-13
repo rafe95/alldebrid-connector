@@ -7,7 +7,7 @@ use alldebrid::{Error as AdError, FileNode, MagnetId, WaitOptions};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 
-use crate::store::{now, sanitize_rel_path, ItemState, Source};
+use crate::store::{now, sanitize_rel_path, ItemFile, ItemState, Source};
 use crate::App;
 
 /// AllDebrid refuses new magnets beyond this many active ones.
@@ -203,16 +203,30 @@ async fn download(app: &App, hash: &str) -> Result<bool> {
             f.path.drain(..prefix.len());
         }
     }
-    let total: u64 = files.iter().map(|f| f.size).sum();
-    app.store.update(hash, |i| i.size = total);
+    let files: Vec<_> = files
+        .into_iter()
+        .map(|f| (sanitize_rel_path(&f.path), f))
+        .filter(|(rel, _)| !rel.as_os_str().is_empty())
+        .collect();
+    if files.is_empty() {
+        bail!("AllDebrid lists no usable file names for this magnet");
+    }
+    let total: u64 = files.iter().map(|(_, f)| f.size).sum();
+    let recorded: Vec<ItemFile> = files
+        .iter()
+        .map(|(rel, f)| ItemFile {
+            path: rel.clone(),
+            size: f.size,
+        })
+        .collect();
+    app.store.update(hash, |i| {
+        i.size = total;
+        i.files = recorded;
+    });
 
-    let root = item.content_path();
+    let root = item.folder();
     let mut done = 0u64;
-    for f in &files {
-        let rel = sanitize_rel_path(&f.path);
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
+    for (rel, f) in &files {
         let target = root.join(rel);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent)

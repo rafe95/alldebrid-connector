@@ -1,6 +1,6 @@
 [package]
 name = "alldebrid-connector"
-version = "0.1.0"
+version = "0.1.1"
 description = "Backend that sends torrents to AllDebrid and downloads the results into category folders"
 edition.workspace = true
 rust-version.workspace = true

@@ -42,6 +42,36 @@ pub fn sanitize_rel_path(p: &str) -> PathBuf {
         .collect()
 }
 
+/// List the finished files below `root` (recursively, sorted, `.part` files skipped).
+/// A missing or unreadable folder gives an empty list.
+pub fn scan_files(root: &Path) -> Vec<ItemFile> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<ItemFile>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else if meta.is_file() && path.extension().map_or(true, |e| e != "part") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(ItemFile {
+                        path: rel.to_owned(),
+                        size: meta.len(),
+                    });
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
 /// Where an item is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +98,15 @@ pub enum Source {
     Torrent(PathBuf),
 }
 
+/// One file of a download, relative to the item folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemFile {
+    /// Sanitized path below the item folder.
+    pub path: PathBuf,
+    /// Size in bytes.
+    pub size: u64,
+}
+
 /// One download.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
@@ -89,6 +128,9 @@ pub struct Item {
     pub magnet_id: Option<u64>,
     /// Total size in bytes (0 while unknown).
     pub size: u64,
+    /// Files of the item, in download order (empty until AllDebrid has listed them).
+    #[serde(default)]
+    pub files: Vec<ItemFile>,
     /// Bytes AllDebrid has fetched so far.
     pub cloud_downloaded: u64,
     /// AllDebrid's fetch speed, bytes/s.
@@ -126,6 +168,7 @@ impl Item {
             error: None,
             magnet_id: None,
             size: 0,
+            files: Vec::new(),
             cloud_downloaded: 0,
             cloud_speed: 0,
             local_downloaded: 0,
@@ -136,9 +179,23 @@ impl Item {
         }
     }
 
-    /// Folder that holds this item's files.
+    /// Name of the item folder below `save_path`.
+    pub fn folder_name(&self) -> String {
+        sanitize_component(&self.name)
+    }
+
+    /// Folder that holds this item's files (one per item, whatever the number of files).
+    pub fn folder(&self) -> PathBuf {
+        self.save_path.join(self.folder_name())
+    }
+
+    /// The qBittorrent `content_path`: the file itself for a single-file item, the item
+    /// folder otherwise (and while the files are not known yet).
     pub fn content_path(&self) -> PathBuf {
-        self.save_path.join(sanitize_component(&self.name))
+        match self.files.as_slice() {
+            [only] => self.folder().join(&only.path),
+            _ => self.folder(),
+        }
     }
 
     /// Overall progress, 0.0..=1.0: the cloud phase is the first half, the disk phase the second.
@@ -178,15 +235,25 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        let mut backfilled = false;
         for item in items.values_mut() {
             if item.state == ItemState::Downloading {
                 item.state = ItemState::Processing;
             }
+            // Items completed before files were recorded (0.1.0): read them from disk.
+            if item.state == ItemState::Completed && item.files.is_empty() {
+                item.files = scan_files(&item.folder());
+                backfilled |= !item.files.is_empty();
+            }
         }
-        Ok(Self {
+        let store = Self {
             path,
             items: Mutex::new(items),
-        })
+        };
+        if backfilled {
+            store.save(&store.items.lock().unwrap());
+        }
+        Ok(store)
     }
 
     fn save(&self, items: &BTreeMap<String, Item>) {
@@ -315,5 +382,93 @@ mod tests {
         assert_eq!(s.get("b").unwrap().state, ItemState::Queued);
         assert!(s.remove("a").is_some());
         assert!(!s.set_progress("a", 1));
+    }
+
+    fn item(name: &str, save: &Path, files: &[(&str, u64)]) -> Item {
+        let mut i = Item::new(
+            "h".into(),
+            name.into(),
+            "movies".into(),
+            save.to_owned(),
+            Source::Magnet("m".into()),
+        );
+        i.files = files
+            .iter()
+            .map(|(p, s)| ItemFile {
+                path: p.into(),
+                size: *s,
+            })
+            .collect();
+        i
+    }
+
+    #[test]
+    fn content_path_is_the_file_for_one_file_and_the_folder_otherwise() {
+        let save = Path::new("/downloads/movies");
+        let grinch = "How.the.Grinch.Stole.Christmas.2000.2160p.UHD.Blu-ray.Remux.DV.HDR.HEVC.TrueHD.Atmos.7.1-CiNEPHiLES.mkv";
+        let i = item(grinch, save, &[(grinch, 5)]);
+        assert_eq!(i.content_path(), save.join(grinch).join(grinch));
+        assert_eq!(i.folder(), save.join(grinch));
+
+        let i = item("Movie (2001)", save, &[("movie.mp4", 5)]);
+        assert_eq!(i.content_path(), save.join("Movie (2001)/movie.mp4"));
+
+        let i = item("Pack", save, &[("a.mkv", 1), ("Subs/a.en.srt", 1)]);
+        assert_eq!(i.content_path(), save.join("Pack"));
+
+        let i = item("Unknown.Yet", save, &[]);
+        assert_eq!(i.content_path(), save.join("Unknown.Yet"));
+    }
+
+    #[test]
+    fn completed_items_without_files_are_backfilled_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = dir.path().join("downloads/movies");
+        let name = "Old.Movie.mkv";
+        std::fs::create_dir_all(save.join(name)).unwrap();
+        std::fs::write(save.join(name).join(name), "12345").unwrap();
+        std::fs::write(save.join(name).join("leftover.mkv.part"), "x").unwrap();
+        let mut done = item(name, &save, &[]);
+        done.state = ItemState::Completed;
+        let mut gone = item("Gone", &save, &[]);
+        gone.hash = "g".into();
+        gone.state = ItemState::Completed;
+        let state: BTreeMap<_, _> = [("h".to_owned(), done), ("g".to_owned(), gone)].into();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // The 0.1.0 state file has no `files` field.
+        let mut json = serde_json::to_value(&state).unwrap();
+        for v in json.as_object_mut().unwrap().values_mut() {
+            v.as_object_mut().unwrap().remove("files");
+        }
+        std::fs::write(data.join("state.json"), json.to_string()).unwrap();
+
+        let s = Store::open(&data).unwrap();
+        let i = s.get("h").unwrap();
+        assert_eq!(
+            i.files,
+            vec![ItemFile {
+                path: name.into(),
+                size: 5
+            }]
+        );
+        assert_eq!(i.content_path(), save.join(name).join(name));
+        assert!(s.get("g").unwrap().files.is_empty());
+        // The backfill is saved.
+        assert!(std::fs::read_to_string(data.join("state.json"))
+            .unwrap()
+            .contains("\"files\""));
+    }
+
+    #[test]
+    fn scans_nested_files_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Subs")).unwrap();
+        std::fs::write(dir.path().join("b.mkv"), "bb").unwrap();
+        std::fs::write(dir.path().join("Subs/a.srt"), "a").unwrap();
+        let files = scan_files(dir.path());
+        let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, [PathBuf::from("Subs/a.srt"), PathBuf::from("b.mkv")]);
+        assert!(scan_files(&dir.path().join("nope")).is_empty());
     }
 }

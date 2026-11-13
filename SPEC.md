@@ -359,6 +359,8 @@ change (not on every progress update). On start, items that were `downloading` g
   the part.
 - A file already on disk with the expected size is skipped.
 - Each file is tried up to 4 times with a growing pause; after that the item fails with the error text.
+- The file list (sanitised relative paths and sizes) is saved with the item before the first file is
+  fetched; it drives `content_path` and `torrents/files`.
 - Paths from AllDebrid are sanitised: `.`/`..` and empty components are dropped, and separators and
   control characters inside a component are replaced, so nothing can be written outside the item folder.
 
@@ -391,16 +393,24 @@ Enough of the qBittorrent API for Radarr/Sonarr to add the connector as a qBitto
 | `torrents/categories` | Configured categories plus any labels in use |
 | `torrents/add` | Multipart or urlencoded: `urls` (one per line), `torrents` (files), `category` |
 | `torrents/info` | Optional `category` and `hashes` (separated by a pipe character, or `all`) filters |
-| `torrents/properties`, `torrents/files` | Minimal data for one `hash` |
+| `torrents/properties` | Minimal data for one `hash` |
+| `torrents/files` | One entry per file of `hash`; `name` is relative to `save_path` (`<item folder>/<path>`) |
 | `torrents/delete` | `hashes` (required) and `deleteFiles` |
 | `torrents/setCategory` | Changes the label only; files already on disk are not moved |
 | anything else | Accepted and ignored (`Ok.`): pause, resume, share limits, `createCategory`… |
 
 State mapping: `queued` → `queuedDL`; `processing`/`downloading` → `downloading`; `completed` →
 `pausedUP` with `ratio` 1.0 against a `ratio_limit` of 1.0, so the client sees a finished torrent that
-has met its seeding goal and may import and remove it; `failed` → `error`.
-`save_path` is the category folder and `content_path` the item folder. Radarr/Sonarr must see those
-paths as the connector does (same mount, or a remote path mapping).
+has met its seeding goal and may import and remove it; `completed` whose files are no longer on
+disk (or cannot be read) → `missingFiles`, which Radarr/Sonarr show as a warning; `failed` → `error`.
+
+Paths (since 0.1.1), following qBittorrent: `save_path` is the category folder. `content_path` is
+the file itself for a single-file item (`<save_path>/<item folder>/<file>`) and the item folder for a
+multi-file item, or while the files are not known yet. For every entry of `torrents/files`,
+`<save_path>/<name>` is the file on disk. Every item keeps its own folder on disk whatever the number
+of files; only the reported paths follow qBittorrent. Items completed by 0.1.0 have no recorded file
+list: at startup it is read back from their folder (`.part` files ignored) and saved.
+Radarr/Sonarr must see those paths as the connector does (same mount, or a remote path mapping).
 
 ### 15.7 Configuration
 
@@ -435,10 +445,15 @@ The binary does not read `.env` files; Compose does.
 
 ### 15.9 Tests and verification
 
-- **Unit:** magnet and `.torrent` hashing, category resolution, path sanitising, state persistence.
+- **Unit:** magnet and `.torrent` hashing, category resolution, path sanitising, state persistence,
+  backfilling the file list of 0.1.0 items; `content_path`/`torrents/files` for a single MKV in a
+  release-named folder, a single MP4, several videos, videos with subtitles in a subfolder, completed
+  and incomplete items, names with spaces, brackets, quotes, backslashes and Unicode (valid JSON
+  escapes only), and missing files (`missingFiles`).
 - **End to end (`tests/e2e.rs`):** the real server and worker against a `wiremock` AllDebrid and file
   host: qBittorrent add → download → delete, resuming a `.part` file through the REST API, an unknown
-  category landing in `other`, and rejection of invalid input.
+  category landing in `other`, rejection of invalid input, a single file named like the release
+  (`<name>/<name>`, the 0.1.0 Radarr import failure), and a multi-file item with a subfolder.
 - **Real API (2026-11-12):** the Fedora Budgie 45 `.torrent` link, category `other`: fetched,
   uploaded with `magnet/upload/file`, downloaded (3.1 GB), SHA-256 matched the official checksum,
   and the magnet was deleted afterwards without error.

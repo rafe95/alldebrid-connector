@@ -142,7 +142,7 @@ impl App {
             }
         }
         if delete_files {
-            let _ = tokio::fs::remove_dir_all(item.content_path()).await;
+            let _ = tokio::fs::remove_dir_all(item.folder()).await;
         }
         true
     }
